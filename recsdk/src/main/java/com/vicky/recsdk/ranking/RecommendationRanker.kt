@@ -21,6 +21,9 @@ internal class RecommendationRanker(
             return RecoResult(emptyList(), System.currentTimeMillis())
         }
 
+        // Allow ML scorers to pre-load their data
+        strategies.forEach { it.prepare() }
+
         val scoredItems = items.map { item ->
             val totalScore = strategies.zip(weights).sumOf { (strategy, weight) ->
                 strategy.score(item, profile) * weight

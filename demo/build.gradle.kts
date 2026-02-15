@@ -35,6 +35,7 @@ android {
 
 dependencies {
     implementation(project(":recsdk"))
+    implementation(project(":recsdk-tflite"))
 
     // Compose BOM
     val composeBom = platform("androidx.compose:compose-bom:2023.10.01")

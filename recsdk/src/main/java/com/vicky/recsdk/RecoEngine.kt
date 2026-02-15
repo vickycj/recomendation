@@ -3,14 +3,15 @@ package com.vicky.recsdk
 import android.content.Context
 import android.util.Log
 import com.google.gson.Gson
+import com.vicky.recsdk.ml.CoOccurrenceEngine
+import com.vicky.recsdk.ml.EmbeddingBridge
+import com.vicky.recsdk.ml.SimilarityEngine
+import com.vicky.recsdk.ml.TfIdfEngine
 import com.vicky.recsdk.model.*
 import com.vicky.recsdk.profile.ItemClassifier
 import com.vicky.recsdk.profile.KeywordClassifier
 import com.vicky.recsdk.profile.ProfileBuilder
-import com.vicky.recsdk.ranking.BrandAffinityScorer
-import com.vicky.recsdk.ranking.CategoryAffinityScorer
-import com.vicky.recsdk.ranking.RecommendationRanker
-import com.vicky.recsdk.ranking.TagAffinityScorer
+import com.vicky.recsdk.ranking.*
 import com.vicky.recsdk.storage.RecoDatabase
 import com.vicky.recsdk.storage.entity.ItemCacheEntity
 import com.vicky.recsdk.tracking.BehaviorScorer
@@ -34,6 +35,10 @@ object RecoEngine {
     private lateinit var classifier: ItemClassifier
     private lateinit var timeProvider: TimeProvider
     private val gson = Gson()
+
+    // ML engines
+    private var coOccurrenceEngine: CoOccurrenceEngine? = null
+    private var similarityEngine: SimilarityEngine? = null
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val feedItems = CopyOnWriteArrayList<RecoItem>()
@@ -76,21 +81,17 @@ object RecoEngine {
             enableTextClassification = config.enableTextClassification
         )
 
-        this.ranker = RecommendationRanker(
-            strategies = listOf(
-                CategoryAffinityScorer(),
-                BrandAffinityScorer(),
-                TagAffinityScorer(classifier)
-            )
-        )
+        // Build strategies and weights based on config
+        buildStrategies(config)
 
         isInitialized = true
         log("Initialized with config: $config")
 
-        // Load persisted profile and prune old events
+        // Load persisted data
         scope.launch {
             profileBuilder.loadPersistedProfile()
             eventTracker.pruneOldEvents(config.eventRetentionDays)
+            similarityEngine?.loadPersistedEmbeddings()
         }
     }
 
@@ -118,14 +119,60 @@ object RecoEngine {
             timeProvider = timeProvider,
             enableTextClassification = config.enableTextClassification
         )
-        this.ranker = RecommendationRanker(
-            strategies = listOf(
-                CategoryAffinityScorer(),
-                BrandAffinityScorer(),
-                TagAffinityScorer(classifier)
-            )
-        )
+
+        buildStrategies(config)
         isInitialized = true
+    }
+
+    /**
+     * Build scoring strategies and ranker based on config.
+     * Uses EmbeddingBridge if a custom provider is set, otherwise TfIdfEngine.
+     */
+    private fun buildStrategies(config: RecoConfig) {
+        val strategies = mutableListOf<ScoringStrategy>()
+        val weights = mutableListOf<Double>()
+
+        // Always include rule-based scorers
+        strategies.add(CategoryAffinityScorer())
+        strategies.add(BrandAffinityScorer())
+        strategies.add(TagAffinityScorer(classifier))
+
+        if (config.enableCoOccurrence || config.enableSemanticSimilarity) {
+            // ML-augmented weights: rule-based get reduced share
+            weights.addAll(listOf(0.20, 0.15, 0.15))
+
+            if (config.enableCoOccurrence) {
+                val engine = CoOccurrenceEngine(database.coOccurrenceDao(), timeProvider)
+                coOccurrenceEngine = engine
+                strategies.add(CoOccurrenceScorer(engine))
+                weights.add(0.25)
+            }
+
+            if (config.enableSemanticSimilarity) {
+                // Use custom provider if available, otherwise default to TF-IDF
+                val engine: SimilarityEngine = if (config.embeddingProvider != null) {
+                    EmbeddingBridge(config.embeddingProvider, database.embeddingDao(), timeProvider)
+                } else {
+                    TfIdfEngine(database.embeddingDao(), timeProvider)
+                }
+                similarityEngine = engine
+                strategies.add(SemanticSimilarityScorer(engine))
+                weights.add(0.25)
+            }
+
+            // If only one ML scorer is enabled, redistribute its missing weight
+            if (!config.enableCoOccurrence) {
+                weights[0] = 0.30; weights[1] = 0.20; weights[2] = 0.20; weights[3] = 0.30
+            }
+            if (!config.enableSemanticSimilarity) {
+                weights[0] = 0.30; weights[1] = 0.20; weights[2] = 0.20; weights[3] = 0.30
+            }
+        } else {
+            // No ML — original weights
+            weights.addAll(listOf(0.35, 0.30, 0.35))
+        }
+
+        this.ranker = RecommendationRanker(strategies, weights)
     }
 
     /**
@@ -157,6 +204,10 @@ object RecoEngine {
                 )
             }
             database.itemCacheDao().insertItems(entities)
+
+            // Build embeddings for new items (TF-IDF or TFLite)
+            similarityEngine?.buildAndStore(items)
+            log("Embeddings built for ${items.size} items")
         }
     }
 
@@ -179,6 +230,13 @@ object RecoEngine {
         scope.launch {
             eventTracker.trackEvent(event)
             profileBuilder.invalidateCache()
+
+            // Rebuild co-occurrence matrix with updated events
+            if (config.enableCoOccurrence) {
+                val events = database.eventDao().getAllEvents()
+                val timeWindowMs = config.coOccurrenceTimeWindowHours * 3600_000L
+                coOccurrenceEngine?.rebuildMatrix(events, timeWindowMs)
+            }
         }
     }
 
@@ -194,6 +252,19 @@ object RecoEngine {
         }
 
         val profile = profileBuilder.getOrBuildProfile(config.profileRebuildIntervalMs)
+
+        // Prepare ML scorers with fresh data before ranking
+        val events = database.eventDao().getAllEvents()
+
+        if (config.enableCoOccurrence && coOccurrenceEngine != null) {
+            val recentItemIds = events.map { it.itemId }.distinct().take(50)
+            coOccurrenceEngine!!.prepareRelatedItems(recentItemIds)
+        }
+
+        if (config.enableSemanticSimilarity && similarityEngine != null) {
+            similarityEngine!!.prepareUserEmbedding(events)
+        }
+
         val result = ranker.rank(feedItems.toList(), profile, limit)
         log("Generated ${result.items.size} recommendations")
         return result
@@ -249,6 +320,8 @@ object RecoEngine {
             eventTracker.clearAll()
             profileBuilder.clearAll()
             database.itemCacheDao().deleteAll()
+            coOccurrenceEngine?.clearAll()
+            similarityEngine?.clearAll()
         }
     }
 
@@ -262,6 +335,8 @@ object RecoEngine {
         scope.cancel()
         RecoDatabase.destroyInstance()
         feedItems.clear()
+        coOccurrenceEngine = null
+        similarityEngine = null
         isInitialized = false
     }
 

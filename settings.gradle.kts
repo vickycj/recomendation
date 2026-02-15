@@ -16,4 +16,5 @@ dependencyResolutionManagement {
 
 rootProject.name = "RecoSDK"
 include(":recsdk")
+include(":recsdk-tflite")
 include(":demo")
